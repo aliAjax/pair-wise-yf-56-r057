@@ -1,49 +1,181 @@
+'use client';
 import { create } from 'zustand';
-import { persist } from 'zustand/middleware';
+import { applyOp, initialState, ROLE_LABELS, uid } from './collab/engine';
+import { server } from './collab/server';
+import type { ActionKind, CollabState, ConflictRecord, Incident, Op, Policy, Role, RolePerms } from './collab/types';
 
-export type Severity = 'medium' | 'high' | 'critical';
-export interface TimelineEvent { id: string; at: string; actor: string; text: string; sensitive?: boolean; }
-export interface SubIncident { id: string; title: string; owner: string; status: 'open' | 'contained' | 'closed'; }
-export interface ResponseAction { id: string; title: string; kind: 'isolate' | 'block' | 'restore' | 'notify'; approvals: string[]; status: 'pending' | 'approved' | 'executed'; sensitive?: boolean; }
-export interface Incident {
-  id: string; title: string; severity: Severity; status: 'investigating' | 'contained' | 'recovered'; affected: string[];
-  subIncidents: SubIncident[]; actions: ResponseAction[]; timeline: TimelineEvent[];
-}
+export interface OutboxItem { op: Op; status: 'pending' | 'failed' | 'conflict'; attempts: number; lastError?: string; conflict?: ConflictRecord; }
+export interface Receipt { id: string; opId: string; summary: string; status: 'pending' | 'acked' | 'failed' | 'conflict'; at: string; }
+
 interface State {
   incident: Incident;
-  role: 'analyst' | 'responder' | 'legal' | 'viewer';
+  policy: Policy;
+  role: Role;
   demoMode: boolean;
-  setRole: (role: State['role']) => void;
+  online: boolean;
+  forceOffline: boolean;
+  outbox: OutboxItem[];
+  receipts: Receipt[];
+  simulateFailure: boolean;
+  hydrate: () => void;
+  setRole: (role: Role) => void;
   toggleDemo: () => void;
+  setForceOffline: (value: boolean) => void;
+  setSimulateFailure: (value: boolean) => void;
   addSubIncident: (payload: { title: string; owner: string }) => void;
+  editAction: (id: string, patch: { title?: string; kind?: ActionKind; sensitive?: boolean }) => void;
   approveAction: (id: string) => void;
   executeAction: (id: string) => void;
   reorderActions: (activeId: string, overId: string) => void;
+  changePerm: (role: Role, perms: Partial<RolePerms>) => void;
   tick: () => void;
+  flushOutbox: () => Promise<void>;
+  retryOp: (opId: string) => void;
+  dismissOp: (opId: string) => void;
+  clearReceipt: (id: string) => void;
 }
-const initial: Incident = {
-  id: 'INC-2026-0929', title: '对外网关异常凭证使用', severity: 'critical', status: 'investigating', affected: ['api-gateway', 'customer-portal', 'audit-log'],
-  subIncidents: [
-    { id: 'sub-1', title: '异常会话来源分析', owner: '分析组', status: 'open' },
-    { id: 'sub-2', title: '受影响租户范围确认', owner: '平台组', status: 'open' }
-  ],
-  actions: [
-    { id: 'act-1', title: '隔离异常网关节点', kind: 'isolate', approvals: ['analyst'], status: 'pending', sensitive: true },
-    { id: 'act-2', title: '封禁可疑出口地址', kind: 'block', approvals: [], status: 'pending' },
-    { id: 'act-3', title: '准备客户披露口径', kind: 'notify', approvals: ['legal'], status: 'pending', sensitive: true }
-  ],
-  timeline: [
-    { id: 'e1', at: new Date(Date.now() - 1500000).toISOString(), actor: '告警平台', text: '检测到同一凭证跨三个地域登录', sensitive: true },
-    { id: 'e2', at: new Date(Date.now() - 900000).toISOString(), actor: '值班分析员', text: '确认会话未经过常规办公出口' }
-  ]
-};
-export const useIncidentStore = create<State>()(persist((set, get) => ({
-  incident: initial, role: 'analyst', demoMode: false,
-  setRole: (role) => set({ role }),
-  toggleDemo: () => set((state) => ({ demoMode: !state.demoMode })),
-  addSubIncident: (payload) => { if (get().demoMode) return; set((state) => ({ incident: { ...state.incident, subIncidents: [...state.incident.subIncidents, { id: `sub-${Date.now()}`, ...payload, status: 'open' }], timeline: [{ id: `e-${Date.now()}`, at: new Date().toISOString(), actor: '响应负责人', text: `创建子事件：${payload.title}` }, ...state.incident.timeline] } })); },
-  approveAction: (id) => { if (get().demoMode) return; const state = get(); const action = state.incident.actions.find((item) => item.id === id); if (!action || action.approvals.includes(state.role) || state.role === 'viewer') return; set({ incident: { ...state.incident, actions: state.incident.actions.map((item) => item.id === id ? { ...item, approvals: [...item.approvals, state.role], status: item.approvals.length >= 1 && action.kind === 'isolate' ? 'approved' : item.status } : item), timeline: [{ id: `e-${Date.now()}`, at: new Date().toISOString(), actor: state.role, text: `审批处置动作：${action.title}` }, ...state.incident.timeline] } }); },
-  executeAction: (id) => { const state = get(); const action = state.incident.actions.find((item) => item.id === id); if (!action || state.demoMode || state.role === 'viewer' || (action.kind === 'isolate' && action.approvals.length < 2)) return; set({ incident: { ...state.incident, actions: state.incident.actions.map((item) => item.id === id ? { ...item, status: 'executed' } : item), timeline: [{ id: `e-${Date.now()}`, at: new Date().toISOString(), actor: state.role, text: `执行处置动作：${action.title}`, sensitive: action.sensitive }, ...state.incident.timeline] } }); },
-  reorderActions: (activeId, overId) => { const state = get(); const actions = [...state.incident.actions]; const from = actions.findIndex((item) => item.id === activeId); const to = actions.findIndex((item) => item.id === overId); if (from < 0 || to < 0 || state.demoMode) return; const [moved] = actions.splice(from, 1); actions.splice(to, 0, moved); set({ incident: { ...state.incident, actions } }); },
-  tick: () => set((state) => ({ incident: { ...state.incident, timeline: [{ id: `e-${Date.now()}`, at: new Date().toISOString(), actor: '监测代理', text: `实时检查：${state.incident.affected.length} 项资产状态已更新` }, ...state.incident.timeline].slice(0, 30) } }))
-}), { name: 'yf56-incident-store' }));
+
+function opSummary(op: Op, incident: Incident): string {
+  switch (op.type) {
+    case 'addSubIncident': return `新增子事件「${op.title}」`;
+    case 'editAction': return `编辑处置动作「${incident.actions.find((a) => a.id === op.entityId)?.title ?? op.entityId}」`;
+    case 'approve': return `审批处置动作「${incident.actions.find((a) => a.id === op.entityId)?.title ?? op.entityId}」`;
+    case 'execute': return `执行处置动作「${incident.actions.find((a) => a.id === op.entityId)?.title ?? op.entityId}」`;
+    case 'reorder': return '调整处置动作优先级';
+    case 'policyChange': return `变更${ROLE_LABELS[op.role]}权限`;
+    case 'tick': return '监测点同步';
+  }
+}
+
+let flushing = false;
+let hydrated = false;
+
+export const useIncidentStore = create<State>()((set, get) => {
+  /** 本地乐观应用 + 入待确认回执 + 触发推送。 */
+  function commit(op: Op) {
+    const state = get();
+    if (state.demoMode) return;
+    const { state: next } = applyOp({ incident: state.incident, policy: state.policy, appliedOps: [] }, op);
+    const receipt: Receipt = { id: uid('rc'), opId: op.id, summary: opSummary(op, state.incident), status: 'pending', at: op.at };
+    set({
+      incident: next.incident,
+      policy: next.policy,
+      outbox: [...state.outbox, { op, status: 'pending', attempts: 0 }],
+      receipts: [receipt, ...state.receipts].slice(0, 30)
+    });
+    void get().flushOutbox();
+  }
+
+  async function syncFromServer() {
+    const s: CollabState = server.getState();
+    set({ incident: s.incident, policy: s.policy });
+  }
+
+  return {
+    incident: initialState().incident,
+    policy: initialState().policy,
+    role: 'analyst',
+    demoMode: false,
+    online: typeof navigator !== 'undefined' ? navigator.onLine : true,
+    forceOffline: false,
+    outbox: [],
+    receipts: [],
+    simulateFailure: false,
+
+    hydrate: () => {
+      if (hydrated) return;
+      hydrated = true;
+      void syncFromServer();
+      server.subscribe(() => { void syncFromServer(); });
+      const onOnline = () => { set({ online: true }); void get().flushOutbox(); };
+      const onOffline = () => set({ online: false });
+      window.addEventListener('online', onOnline);
+      window.addEventListener('offline', onOffline);
+      set({ online: navigator.onLine });
+    },
+
+    setRole: (role) => set({ role }),
+    toggleDemo: () => set((s) => ({ demoMode: !s.demoMode })),
+    setForceOffline: (forceOffline) => { set({ forceOffline }); if (!forceOffline) void get().flushOutbox(); },
+    setSimulateFailure: (simulateFailure) => { set({ simulateFailure }); server.simulateFailure = simulateFailure; },
+
+    addSubIncident: (payload) => commit({
+      id: uid('op'), type: 'addSubIncident', at: new Date().toISOString(), by: get().role, baseV: get().incident.v, ...payload
+    }),
+    editAction: (entityId, patch) => commit({
+      id: uid('op'), type: 'editAction', at: new Date().toISOString(), by: get().role, baseV: get().incident.actions.find((a) => a.id === entityId)?.v ?? 1, entityId, patch
+    }),
+    approveAction: (entityId) => commit({
+      id: uid('op'), type: 'approve', at: new Date().toISOString(), by: get().role, baseV: get().incident.v, entityId
+    }),
+    executeAction: (entityId) => commit({
+      id: uid('op'), type: 'execute', at: new Date().toISOString(), by: get().role, baseV: get().incident.v, entityId
+    }),
+    reorderActions: (activeId, overId) => {
+      const state = get();
+      if (state.demoMode) return;
+      const actions = [...state.incident.actions];
+      const from = actions.findIndex((a) => a.id === activeId);
+      const to = actions.findIndex((a) => a.id === overId);
+      if (from < 0 || to < 0) return;
+      const [moved] = actions.splice(from, 1);
+      actions.splice(to, 0, moved);
+      commit({ id: uid('op'), type: 'reorder', at: new Date().toISOString(), by: state.role, baseV: state.incident.v, order: actions.map((a) => a.id) });
+    },
+    changePerm: (role, perms) => commit({
+      id: uid('op'), type: 'policyChange', at: new Date().toISOString(), by: get().role, baseV: get().policy.v, role, perms
+    }),
+    tick: () => commit({ id: uid('op'), type: 'tick', at: new Date().toISOString(), by: '系统', baseV: get().incident.v }),
+
+    flushOutbox: async () => {
+      if (flushing) return;
+      const state = get();
+      if (state.forceOffline || !state.online) return;
+      const item = state.outbox.find((i) => i.status === 'pending' || i.status === 'failed');
+      if (!item) return;
+      flushing = true;
+      set({ outbox: get().outbox.map((i) => i.op.id === item.op.id ? { ...i, status: 'pending', attempts: i.attempts + 1, lastError: undefined } : i) });
+      try {
+        const result = await server.applyOp(item.op);
+        if (result.ok) {
+          set({
+            outbox: get().outbox.filter((i) => i.op.id !== item.op.id),
+            receipts: get().receipts.map((r) => r.opId === item.op.id ? { ...r, status: 'acked' } : r)
+          });
+        } else if (result.conflict) {
+          set({
+            outbox: get().outbox.map((i) => i.op.id === item.op.id ? { ...i, status: 'conflict', conflict: result.conflict } : i),
+            receipts: get().receipts.map((r) => r.opId === item.op.id ? { ...r, status: 'conflict' } : r)
+          });
+        } else {
+          set({
+            outbox: get().outbox.map((i) => i.op.id === item.op.id ? { ...i, status: 'failed', lastError: result.error } : i),
+            receipts: get().receipts.map((r) => r.opId === item.op.id ? { ...r, status: 'failed' } : r)
+          });
+        }
+        await syncFromServer();
+      } catch (e) {
+        const err = e as Error;
+        set({
+          outbox: get().outbox.map((i) => i.op.id === item.op.id ? { ...i, status: 'failed', lastError: err.message } : i),
+          receipts: get().receipts.map((r) => r.opId === item.op.id ? { ...r, status: 'failed' } : r)
+        });
+        if (get().online && !get().forceOffline) {
+          window.setTimeout(() => { if (get().online && !get().forceOffline) void get().flushOutbox(); }, 4000);
+        }
+      } finally {
+        flushing = false;
+        // 仅当队列中没有失败项时继续推送；失败项等待自动重试/手动重试/放弃
+        const hasFailed = get().outbox.some((i) => i.status === 'failed');
+        if (!hasFailed && get().online && !get().forceOffline) void get().flushOutbox();
+      }
+    },
+
+    retryOp: (opId) => {
+      set({ outbox: get().outbox.map((i) => i.op.id === opId ? { ...i, status: 'pending', lastError: undefined } : i) });
+      void get().flushOutbox();
+    },
+    dismissOp: (opId) => set({ outbox: get().outbox.filter((i) => i.op.id !== opId) }),
+    clearReceipt: (id) => set({ receipts: get().receipts.filter((r) => r.id !== id) })
+  };
+});
