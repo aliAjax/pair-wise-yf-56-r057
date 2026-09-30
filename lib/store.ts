@@ -1,49 +1,376 @@
 import { create } from 'zustand';
-import { persist } from 'zustand/middleware';
+import { createJSONStorage, persist } from 'zustand/middleware';
+import {
+  actionNames,
+  applyOperation,
+  buildLocalView,
+  canApproveAction,
+  createChannel,
+  createId,
+  defaultPolicies,
+  meetsIsolationRule,
+  postSnapshot,
+  readRemoteSnapshot,
+  roleNames,
+  settleOperation,
+  type CollabOperation,
+  type CollabSnapshot,
+  type IncidentStatus,
+  type QueuedOperation,
+  type ResponseAction,
+  type Role,
+  type RolePolicyMap,
+  type SubIncidentStatus
+} from './collab';
 
-export type Severity = 'medium' | 'high' | 'critical';
-export interface TimelineEvent { id: string; at: string; actor: string; text: string; sensitive?: boolean; }
-export interface SubIncident { id: string; title: string; owner: string; status: 'open' | 'contained' | 'closed'; }
-export interface ResponseAction { id: string; title: string; kind: 'isolate' | 'block' | 'restore' | 'notify'; approvals: string[]; status: 'pending' | 'approved' | 'executed'; sensitive?: boolean; }
-export interface Incident {
-  id: string; title: string; severity: Severity; status: 'investigating' | 'contained' | 'recovered'; affected: string[];
-  subIncidents: SubIncident[]; actions: ResponseAction[]; timeline: TimelineEvent[];
-}
-interface State {
-  incident: Incident;
-  role: 'analyst' | 'responder' | 'legal' | 'viewer';
+interface IncidentState {
+  snapshot: CollabSnapshot;
+  queue: QueuedOperation[];
+  role: Role;
   demoMode: boolean;
-  setRole: (role: State['role']) => void;
+  forceOffline: boolean;
+  simulateFailureNext: boolean;
+  online: boolean;
+  hydrated: boolean;
+  clientId: string;
+  setRole: (role: Role) => void;
   toggleDemo: () => void;
+  setForceOffline: (value: boolean) => void;
+  setSimulateFailureNext: (value: boolean) => void;
   addSubIncident: (payload: { title: string; owner: string }) => void;
+  updateSubIncident: (id: string, payload: { title?: string; owner?: string; status?: SubIncidentStatus }) => void;
+  updateIncidentStatus: (status: IncidentStatus) => void;
+  addTimelineNote: (payload: { text: string; sensitive: boolean }) => void;
   approveAction: (id: string) => void;
+  saveAction: (id: string, expectedRevision: number, payload: { title: string; sensitive: boolean }) => void;
   executeAction: (id: string) => void;
-  reorderActions: (activeId: string, overId: string) => void;
+  retryReceipt: (id: string) => void;
+  reorderActions: (actionOrder: string[]) => void;
+  updatePolicies: (policies: RolePolicyMap, summary: string) => void;
+  resolveConflict: (id: string) => void;
+  dismissQueueEntry: (id: string) => void;
+  settleReceipt: (actionId: string, receiptId: string, attempts: number) => void;
   tick: () => void;
+  flushQueue: () => Promise<void>;
 }
-const initial: Incident = {
-  id: 'INC-2026-0929', title: '对外网关异常凭证使用', severity: 'critical', status: 'investigating', affected: ['api-gateway', 'customer-portal', 'audit-log'],
-  subIncidents: [
-    { id: 'sub-1', title: '异常会话来源分析', owner: '分析组', status: 'open' },
-    { id: 'sub-2', title: '受影响租户范围确认', owner: '平台组', status: 'open' }
-  ],
-  actions: [
-    { id: 'act-1', title: '隔离异常网关节点', kind: 'isolate', approvals: ['analyst'], status: 'pending', sensitive: true },
-    { id: 'act-2', title: '封禁可疑出口地址', kind: 'block', approvals: [], status: 'pending' },
-    { id: 'act-3', title: '准备客户披露口径', kind: 'notify', approvals: ['legal'], status: 'pending', sensitive: true }
-  ],
-  timeline: [
-    { id: 'e1', at: new Date(Date.now() - 1500000).toISOString(), actor: '告警平台', text: '检测到同一凭证跨三个地域登录', sensitive: true },
-    { id: 'e2', at: new Date(Date.now() - 900000).toISOString(), actor: '值班分析员', text: '确认会话未经过常规办公出口' }
-  ]
-};
-export const useIncidentStore = create<State>()(persist((set, get) => ({
-  incident: initial, role: 'analyst', demoMode: false,
-  setRole: (role) => set({ role }),
-  toggleDemo: () => set((state) => ({ demoMode: !state.demoMode })),
-  addSubIncident: (payload) => { if (get().demoMode) return; set((state) => ({ incident: { ...state.incident, subIncidents: [...state.incident.subIncidents, { id: `sub-${Date.now()}`, ...payload, status: 'open' }], timeline: [{ id: `e-${Date.now()}`, at: new Date().toISOString(), actor: '响应负责人', text: `创建子事件：${payload.title}` }, ...state.incident.timeline] } })); },
-  approveAction: (id) => { if (get().demoMode) return; const state = get(); const action = state.incident.actions.find((item) => item.id === id); if (!action || action.approvals.includes(state.role) || state.role === 'viewer') return; set({ incident: { ...state.incident, actions: state.incident.actions.map((item) => item.id === id ? { ...item, approvals: [...item.approvals, state.role], status: item.approvals.length >= 1 && action.kind === 'isolate' ? 'approved' : item.status } : item), timeline: [{ id: `e-${Date.now()}`, at: new Date().toISOString(), actor: state.role, text: `审批处置动作：${action.title}` }, ...state.incident.timeline] } }); },
-  executeAction: (id) => { const state = get(); const action = state.incident.actions.find((item) => item.id === id); if (!action || state.demoMode || state.role === 'viewer' || (action.kind === 'isolate' && action.approvals.length < 2)) return; set({ incident: { ...state.incident, actions: state.incident.actions.map((item) => item.id === id ? { ...item, status: 'executed' } : item), timeline: [{ id: `e-${Date.now()}`, at: new Date().toISOString(), actor: state.role, text: `执行处置动作：${action.title}`, sensitive: action.sensitive }, ...state.incident.timeline] } }); },
-  reorderActions: (activeId, overId) => { const state = get(); const actions = [...state.incident.actions]; const from = actions.findIndex((item) => item.id === activeId); const to = actions.findIndex((item) => item.id === overId); if (from < 0 || to < 0 || state.demoMode) return; const [moved] = actions.splice(from, 1); actions.splice(to, 0, moved); set({ incident: { ...state.incident, actions } }); },
-  tick: () => set((state) => ({ incident: { ...state.incident, timeline: [{ id: `e-${Date.now()}`, at: new Date().toISOString(), actor: '监测代理', text: `实时检查：${state.incident.affected.length} 项资产状态已更新` }, ...state.incident.timeline].slice(0, 30) } }))
-}), { name: 'yf56-incident-store' }));
+
+let channel: BroadcastChannel | null = null;
+const timers = new Map<string, ReturnType<typeof setTimeout>>();
+let flushInFlight = false;
+let flushQueued = false;
+
+async function withCollabLock<T>(task: () => T | Promise<T>): Promise<T> {
+  if (typeof navigator !== 'undefined' && navigator.locks?.request) {
+    return navigator.locks.request('yf56-collab-write', async () => task());
+  }
+  return task();
+}
+
+function scheduleFlush() {
+  setTimeout(() => { void useIncidentStore.getState().flushQueue(); }, 0);
+}
+
+function browserOnline() {
+  return typeof navigator === 'undefined' ? true : navigator.onLine;
+}
+
+function isExecutableAction(action: ResponseAction, policies: RolePolicyMap) {
+  return action.status !== 'executed' && action.status !== 'invalid' && (action.kind !== 'isolate' || meetsIsolationRule(policies, action));
+}
+const initialClientId = createId('client');
+
+function schedulePendingReceipts(snapshot: CollabSnapshot) {
+  const clientId = useIncidentStore.getState().clientId;
+  snapshot.incident.actions.forEach((action) => {
+    const receipt = action.execution;
+    if (action.status !== 'executing' || !receipt || receipt.state !== 'pending_ack') return;
+    const timerKey = `${receipt.id}:${receipt.attempts}`;
+    if (timers.has(timerKey)) return;
+    const ownsReceipt = receipt.ownerClientId === clientId;
+    const age = Date.now() - new Date(receipt.at).getTime();
+    const delay = ownsReceipt ? 1000 : Math.max(0, 2200 - age);
+    const timer = setTimeout(() => {
+      timers.delete(timerKey);
+      useIncidentStore.getState().settleReceipt(action.id, receipt.id, receipt.attempts);
+    }, delay);
+    timers.set(timerKey, timer);
+  });
+}
+
+export const useIncidentStore = create<IncidentState>()(persist((set, get) => {
+  function publish(snapshot: CollabSnapshot) {
+    set({ snapshot });
+    postSnapshot(channel, snapshot, get().clientId);
+  }
+
+  async function flushQueue() {
+    if (flushInFlight) {
+      flushQueued = true;
+      return;
+    }
+    const state = get();
+    if (state.demoMode || state.forceOffline || !browserOnline()) return;
+    if (state.queue.filter((item) => item.status === 'queued').length === 0) return;
+    flushInFlight = true;
+    try {
+      await withCollabLock(() => {
+        const currentState = get();
+        let current = readRemoteSnapshot();
+        const remaining: QueuedOperation[] = [];
+        const localActionRevisions = new Map<string, number>();
+        for (const item of currentState.queue) {
+          if (item.status !== 'queued') {
+            remaining.push(item);
+            continue;
+          }
+          let op = item.op;
+          if (op.type === 'edit-action') {
+            op = { ...op, expectedRevision: op.expectedRevision - (localActionRevisions.get(op.actionId) ?? 0) };
+          }
+          const result = applyOperation(current, op);
+          if (result.code === 'revision_conflict' && result.conflict && item.op.type === 'edit-action') {
+            result.conflict.expectedRevision = item.op.expectedRevision;
+          }
+          current = result.snapshot;
+          if ((op.type === 'edit-action' || op.type === 'approve-action') && result.accepted) {
+            localActionRevisions.set(op.actionId, (localActionRevisions.get(op.actionId) ?? 0) + 1);
+          }
+          if (result.accepted) continue;
+          if (result.code === 'operation_already_applied') continue;
+          remaining.push({
+            ...item,
+            status: result.code === 'revision_conflict' ? 'conflicted' : 'rejected',
+            processedAt: new Date().toISOString(),
+            code: result.code,
+            conflictId: result.conflict?.id
+          });
+        }
+        publish(current);
+        set({ queue: remaining });
+        schedulePendingReceipts(current);
+      });
+    } finally {
+      flushInFlight = false;
+      if (flushQueued) {
+        flushQueued = false;
+        await flushQueue();
+      }
+    }
+  }
+
+  async function commitOrQueue(op: CollabOperation) {
+    const state = get();
+    if (state.demoMode) return;
+    const online = browserOnline() && !state.forceOffline;
+    if (!online) {
+      set((value) => ({ queue: [...value.queue, { op, status: 'queued', queuedAt: new Date().toISOString() }] }));
+      return;
+    }
+
+    if (state.queue.some((item) => item.status === 'queued')) {
+      set((value) => ({ queue: [...value.queue, { op, status: 'queued', queuedAt: new Date().toISOString() }] }));
+      await flushQueue();
+      return;
+    }
+
+    await withCollabLock(() => {
+      const remote = readRemoteSnapshot();
+      const result = applyOperation(remote, op);
+      if (result.accepted || result.code === 'revision_conflict' || result.code === 'operation_already_applied') {
+        publish(result.snapshot);
+        if (result.executionRequested) schedulePendingReceipts(result.snapshot);
+      }
+    });
+  }
+
+  function makeOperation<T extends Omit<CollabOperation, 'id' | 'clientId' | 'at' | 'actorRole' | 'actorName'>>(partial: T, consumeFailure = false) {
+    const state = get();
+    const simulateFailure = consumeFailure && state.simulateFailureNext;
+    if (consumeFailure) set({ simulateFailureNext: false });
+    return {
+      ...partial,
+      id: createId('op'),
+      clientId: state.clientId,
+      at: new Date().toISOString(),
+      actorRole: state.role,
+      actorName: roleNames[state.role],
+      ...(simulateFailure ? { simulateFailure: true } : {})
+    } as CollabOperation;
+  }
+
+  return {
+    snapshot: readRemoteSnapshot(),
+    queue: [],
+    role: 'analyst',
+    demoMode: false,
+    forceOffline: false,
+    simulateFailureNext: false,
+    online: browserOnline(),
+    hydrated: false,
+    clientId: initialClientId,
+
+    setRole: (role) => set({ role }),
+    toggleDemo: () => set((state) => ({ demoMode: !state.demoMode })),
+    setForceOffline: (value) => {
+      set({ forceOffline: value, online: browserOnline() && !value });
+      if (!value) scheduleFlush();
+    },
+    setSimulateFailureNext: (value) => set({ simulateFailureNext: value }),
+
+    addSubIncident: ({ title, owner }) => {
+      if (get().demoMode) return;
+      commitOrQueue(makeOperation({ type: 'add-sub-incident', subId: createId('sub'), title, owner }));
+    },
+
+    updateSubIncident: (id, payload) => {
+      if (get().demoMode) return;
+      commitOrQueue(makeOperation({ type: 'update-sub-incident', subId: id, ...payload }));
+    },
+
+    updateIncidentStatus: (status) => {
+      if (get().demoMode) return;
+      commitOrQueue(makeOperation({ type: 'update-incident', status }));
+    },
+
+    addTimelineNote: ({ text, sensitive }) => {
+      if (get().demoMode) return;
+      commitOrQueue(makeOperation({ type: 'add-timeline', text, sensitive }));
+    },
+
+    approveAction: (id) => {
+      const state = get();
+      if (state.demoMode || state.role === 'viewer') return;
+      const view = buildLocalView(state.snapshot, state.queue).snapshot;
+      const action = view.incident.actions.find((item) => item.id === id);
+      if (!action || action.approvals.some((approval) => approval.role === state.role) || !canApproveAction(view.rolePolicies, state.role, action)) return;
+      commitOrQueue(makeOperation({ type: 'approve-action', actionId: id }));
+    },
+
+    saveAction: (id, expectedRevision, payload) => {
+      if (get().demoMode) return;
+      commitOrQueue(makeOperation({ type: 'edit-action', actionId: id, expectedRevision, ...payload }));
+    },
+
+    executeAction: (id) => {
+      const state = get();
+      if (state.demoMode || state.role === 'viewer') return;
+      const view = buildLocalView(state.snapshot, state.queue).snapshot;
+      const action = view.incident.actions.find((item) => item.id === id);
+      if (!action || !isExecutableAction(action, view.rolePolicies) || action.execution?.state === 'pending_ack') return;
+      commitOrQueue(makeOperation({ type: 'execute-request', actionId: id, receiptId: createId('receipt') }, true));
+    },
+
+    retryReceipt: (id) => {
+      const state = get();
+      if (state.demoMode || state.role === 'viewer') return;
+      const action = state.snapshot.incident.actions.find((item) => item.id === id);
+      if (!action?.execution || action.execution.state !== 'failed') return;
+      commitOrQueue(makeOperation({
+        type: 'execute-confirm',
+        actionId: id,
+        receiptId: action.execution.id,
+        attempts: action.execution.attempts
+      }, true));
+    },
+
+    reorderActions: (actionOrder) => {
+      if (get().demoMode) return;
+      commitOrQueue(makeOperation({ type: 'reorder-actions', actionOrder }));
+    },
+
+    updatePolicies: (policies, summary) => {
+      if (get().demoMode) return;
+      commitOrQueue(makeOperation({ type: 'update-policy', policies: structuredClone(policies), summary }));
+    },
+
+    resolveConflict: (id) => {
+      void withCollabLock(() => {
+        const remote = readRemoteSnapshot();
+        const snapshot = structuredClone(remote);
+        snapshot.conflicts = snapshot.conflicts.map((conflict) => conflict.id === id ? { ...conflict, resolved: true } : conflict);
+        publish(snapshot);
+      });
+    },
+
+    dismissQueueEntry: (id) => {
+      set((state) => ({ queue: state.queue.filter((item) => item.op.id !== id || item.status === 'queued') }));
+    },
+
+    settleReceipt: (actionId, receiptId, attempts) => {
+      const state = get();
+      if (state.demoMode) return;
+      const action = state.snapshot.incident.actions.find((item) => item.id === actionId);
+      const receipt = action?.execution;
+      if (!action || !receipt || receipt.id !== receiptId || receipt.attempts !== attempts || receipt.state !== 'pending_ack') return;
+      commitOrQueue(settleOperation(receipt, actionId, state.clientId, receipt.willFail === true));
+    },
+
+    tick: () => {
+      if (get().demoMode) return;
+      commitOrQueue(makeOperation({ type: 'tick' }));
+    },
+
+    flushQueue
+  };
+}, {
+  name: 'yf56-incident-collab-v1',
+  partialize: (state) => ({
+    queue: state.queue,
+    role: state.role,
+    demoMode: state.demoMode,
+    forceOffline: state.forceOffline,
+    simulateFailureNext: state.simulateFailureNext,
+    clientId: state.clientId
+  }),
+  storage: createJSONStorage(() => typeof window === 'undefined' ? {
+    getItem: () => null,
+    setItem: () => undefined,
+    removeItem: () => undefined
+  } : window.sessionStorage),
+  onRehydrateStorage: () => (state) => {
+    if (!state) return;
+    const clientId = state.clientId || createId('client');
+    channel = createChannel();
+    const remote = readRemoteSnapshot();
+    state.clientId = clientId;
+    state.snapshot = remote;
+    state.online = browserOnline() && !state.forceOffline;
+    state.hydrated = true;
+
+    channel?.addEventListener('message', (event: MessageEvent<{ clientId?: string; snapshot?: CollabSnapshot }>) => {
+      if (!event.data?.snapshot || event.data.clientId === useIncidentStore.getState().clientId) return;
+      useIncidentStore.setState({ snapshot: event.data.snapshot });
+      void useIncidentStore.getState().flushQueue();
+      schedulePendingReceipts(event.data.snapshot);
+    });
+
+    window.addEventListener('storage', (event) => {
+      if (event.key !== 'yf56-collab-server-v1' || !event.newValue) return;
+      try {
+        const snapshot = JSON.parse(event.newValue) as CollabSnapshot;
+        useIncidentStore.setState({ snapshot });
+        void useIncidentStore.getState().flushQueue();
+        schedulePendingReceipts(snapshot);
+      } catch {
+        // 保留当前快照，等待下一条有效协同消息
+      }
+    });
+
+    const updateOnline = () => {
+      const online = browserOnline() && !useIncidentStore.getState().forceOffline;
+      useIncidentStore.setState({ online });
+      if (online) useIncidentStore.getState().flushQueue();
+    };
+    window.addEventListener('online', updateOnline);
+    window.addEventListener('offline', updateOnline);
+
+    if (state.online) void state.flushQueue();
+    setTimeout(() => schedulePendingReceipts(useIncidentStore.getState().snapshot), 0);
+  }
+}));
+
+export function canEditPolicies(role: Role) {
+  return role !== 'viewer';
+}
+
+export { actionNames, defaultPolicies, roleNames };
